@@ -1,7 +1,8 @@
 """
-LLVM IR Fuzzer using Language Models
+LLVM IR Fuzzer using Language Models - Pattern-Guided Version
 
-Main fuzzing loop that generates IR, validates it, and tracks bugs.
+This version removes FileCheck mutation complexity and focuses on
+generating prompts from signatures + semantic hints.
 """
 
 from pathlib import Path
@@ -13,14 +14,19 @@ import json
 from vllm import LLM, SamplingParams
 
 from idris.config import get_config
-from idris.prompts import collect_seeds, PromptGenerator
+from idris.parser import parse_functions_from_directory
+from idris.prompts import (
+    PatternGuidedGenerator,
+    PromptStrategy,
+    collect_seeds,
+)
 from idris.scoring import score_seeds, get_scoring_stats
 from idris.utils import complete_function, extract_logprobs, save_perplexity_analysis
 from idris.validation import validation_worker
 
 
 def run_idris():
-    """Main fuzzing loop"""
+    """Main fuzzing loop with pattern-guided generation."""
     cfg = get_config()
     
     # Paths
@@ -35,16 +41,25 @@ def run_idris():
     num_workers = cfg["fuzzer"]["num_workers"]
     model_name = cfg["fuzzer"]["model"]
     
-    # Optional settings with defaults
-    mutation_prob = cfg["fuzzer"].get("mutation_prob", 0.4)
+    # Strategy settings
     vector_ratio = cfg["fuzzer"].get("vector_ratio", 0.3)
-    truncate_min = cfg["fuzzer"].get("truncate_min", 0.3)
-    truncate_max = cfg["fuzzer"].get("truncate_max", 0.8)
+    scalable_ratio = cfg["fuzzer"].get("scalable_ratio", 0.2)
     
-    # New: perplexity-based seed selection settings
+    # Perplexity-based seed selection
     score_seeds_enabled = cfg["fuzzer"].get("score_seeds", True)
     weird_ratio = cfg["fuzzer"].get("weird_ratio", 0.3)
     prefer_weird_prob = cfg["fuzzer"].get("prefer_weird_prob", 0.5)
+    
+    # Optional: force a specific strategy for A/B testing
+    # Set to None to use weighted random selection
+    force_strategy_name = cfg["fuzzer"].get("force_strategy", None)
+    force_strategy = None
+    if force_strategy_name:
+        try:
+            force_strategy = PromptStrategy(force_strategy_name)
+            print(f"Forcing strategy: {force_strategy.value}")
+        except ValueError:
+            print(f"Unknown strategy '{force_strategy_name}', using random")
     
     # Setup output directories
     output_dir.mkdir(exist_ok=True)
@@ -55,10 +70,10 @@ def run_idris():
     fp_dir = output_dir / "false_positives"
     fp_dir.mkdir(exist_ok=True)
     
-    # Collect seeds using new parser
-    print("Collecting and parsing seed functions...")
+    # Collect seeds
+    print("Collecting seed functions...")
     seeds = collect_seeds(llvm_test_dir, max_count=10000)
-    print(f"Collected {len(seeds)} parsed seeds")
+    print(f"Collected {len(seeds)} seeds")
     
     # Load model
     print(f"Loading {model_name}...")
@@ -74,41 +89,28 @@ def run_idris():
         print(f"Scoring complete:")
         print(f"  - Scored: {scoring_stats['num_scored']} seeds")
         print(f"  - Perplexity range: {scoring_stats['min_perplexity']:.2f} - {scoring_stats['max_perplexity']:.2f}")
-        print(f"  - Mean perplexity: {scoring_stats['mean_perplexity']:.2f}")
-        print(f"  - Median perplexity: {scoring_stats['median_perplexity']:.2f}")
+        print(f"  - Mean: {scoring_stats['mean_perplexity']:.2f}")
         
-        # Save scoring stats
         (output_dir / "scoring_stats.json").write_text(json.dumps(scoring_stats, indent=2))
-        
-        # Save full scores for analysis
-        scores_data = [
-            {"name": s.name, "perplexity": ppl, "length": len(s.raw_text)}
-            for s, ppl in seed_scores
-        ]
-        (output_dir / "seed_scores.json").write_text(json.dumps(scores_data, indent=2))
     
-    # Create prompt generator
-    prompt_gen = PromptGenerator(
+    # Create pattern-guided generator
+    generator = PatternGuidedGenerator(
         seeds=seeds,
         seed_scores=seed_scores,
         weird_ratio=weird_ratio,
         prefer_weird_prob=prefer_weird_prob,
-        mutation_prob=mutation_prob,
-        truncate_min=truncate_min,
-        truncate_max=truncate_max,
     )
     
-    # Log seed statistics
-    seed_stats = prompt_gen.stats()
-    print(f"Seed statistics:")
-    print(f"  - Total functions: {seed_stats['total_functions']}")
-    print(f"  - Clusters: {seed_stats['num_clusters']}")
-    print(f"  - Vector functions: {seed_stats['vector_seeds']}")
-    print(f"  - Weird seeds: {seed_stats['weird_seeds']}")
-    print(f"  - Normal seeds: {seed_stats['normal_seeds']}")
-    print(f"  - Functions with CHECKs: {seed_stats['functions_with_checks']}")
+    # Log generator stats
+    gen_stats = generator.stats()
+    print(f"\nGenerator statistics:")
+    print(f"  - Total seeds: {gen_stats['total_seeds']}")
+    print(f"  - Vector seeds: {gen_stats['vector_seeds']}")
+    print(f"  - Scalable vector seeds: {gen_stats['scalable_vector_seeds']}")
+    print(f"  - Weird seeds: {gen_stats['weird_seeds']}")
+    print(f"  - Normal seeds: {gen_stats['normal_seeds']}")
     
-    (output_dir / "seed_stats.json").write_text(json.dumps(seed_stats, indent=2))
+    (output_dir / "generator_stats.json").write_text(json.dumps(gen_stats, indent=2))
     
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -120,22 +122,26 @@ def run_idris():
     
     # Statistics tracking
     stats = {
-        "generated": 0, 
-        "valid": 0, 
-        "optimized": 0, 
+        "generated": 0,
+        "valid": 0,
+        "optimized": 0,
         "correct": 0,
-        "bugs": 0, 
-        "timeout": 0, 
+        "bugs": 0,
+        "timeout": 0,
         "false_positives": 0,
         "crashes_verify": 0,
         "crashes_opt": 0,
-        # Track by mutation strategy
-        "by_strategy": {},
-        # New: track by seed weirdness
+        # Track by strategy
+        "by_strategy": {s.value: {"generated": 0, "valid": 0, "bugs": 0, "crashes": 0} 
+                       for s in PromptStrategy},
+        # Track by seed type
         "bugs_from_weird_seeds": 0,
         "bugs_from_normal_seeds": 0,
         "generated_from_weird_seeds": 0,
         "generated_from_normal_seeds": 0,
+        # Track by vector type
+        "bugs_from_scalable_vectors": 0,
+        "generated_with_scalable_vectors": 0,
     }
     stats_lock = threading.Lock()
     
@@ -151,10 +157,12 @@ def run_idris():
     for iteration in range(num_iterations):
         iter_start = time.time()
         
-        # Generate batch of prompts using new generator
-        batch = prompt_gen.generate_batch(
+        # Generate batch of prompts
+        batch = generator.generate_batch(
             batch_size=batch_size,
             vector_ratio=vector_ratio,
+            scalable_ratio=scalable_ratio,
+            strategy=force_strategy,  # None = random weighted selection
         )
         
         prompts = [p for p, _ in batch]
@@ -163,13 +171,21 @@ def run_idris():
         # Generate completions
         outputs = llm.generate(prompts, sampling_params)
         
+        # Update generation stats
         with stats_lock:
             stats["generated"] += len(outputs)
             for meta in metadata_list:
+                strategy = meta.get("strategy", "unknown")
+                if strategy in stats["by_strategy"]:
+                    stats["by_strategy"][strategy]["generated"] += 1
+                
                 if meta.get("is_weird_seed"):
                     stats["generated_from_weird_seeds"] += 1
                 else:
                     stats["generated_from_normal_seeds"] += 1
+                
+                if meta.get("seed_has_scalable_vectors"):
+                    stats["generated_with_scalable_vectors"] += 1
         
         # Process completions
         for idx, output in enumerate(outputs):
@@ -188,15 +204,17 @@ def run_idris():
             
             # Extract perplexity info
             ppl_info = extract_logprobs(output)
-            ppl_info["mutation_strategy"] = metadata["strategy"]
-            ppl_info["seed_has_vectors"] = metadata["seed_has_vectors"]
+            ppl_info["strategy"] = metadata.get("strategy")
+            ppl_info["seed_has_vectors"] = metadata.get("seed_has_vectors", False)
+            ppl_info["seed_has_scalable_vectors"] = metadata.get("seed_has_scalable_vectors", False)
             ppl_info["is_weird_seed"] = metadata.get("is_weird_seed", False)
             ppl_info["seed_perplexity"] = metadata.get("seed_perplexity")
+            ppl_info["pattern_name"] = metadata.get("pattern_name")
             
             # Submit for validation
             future = executor.submit(
                 validation_worker,
-                (ir, prompt, metadata["strategy"], ppl_info),
+                (ir, prompt, metadata.get("strategy", "unknown"), ppl_info),
                 bugs_dir, valid_dir, fp_dir, stats, stats_lock,
                 perplexity_log, ppl_lock
             )
@@ -212,13 +230,17 @@ def run_idris():
         
         with stats_lock:
             crashes = stats.get('crashes_verify', 0) + stats.get('crashes_opt', 0)
-            weird_bugs = stats.get('bugs_from_weird_seeds', 0)
-            normal_bugs = stats.get('bugs_from_normal_seeds', 0)
+            
+            # Strategy breakdown
+            strategy_bugs = {k: v["bugs"] for k, v in stats["by_strategy"].items() if v["bugs"] > 0}
+            strategy_str = " ".join([f"{k}:{v}" for k, v in strategy_bugs.items()]) if strategy_bugs else ""
+            
             print(f"[{iteration+1}/{num_iterations}] {iter_time:.1f}s | "
-                  f"Gen:{stats['generated']} Valid:{stats['valid']} Opt:{stats['optimized']} "
-                  f"Correct:{stats['correct']} Bugs:{stats['bugs']} (W:{weird_bugs}/N:{normal_bugs}) "
-                  f"Crashes:{crashes} FP:{stats['false_positives']} Timeout:{stats['timeout']} "
+                  f"Gen:{stats['generated']} Valid:{stats['valid']} "
+                  f"Bugs:{stats['bugs']} Crashes:{crashes} "
                   f"Pending:{len(pending_futures)}")
+            if strategy_str:
+                print(f"  Bugs by strategy: {strategy_str}")
         
         # Periodic saves
         if iteration % 10 == 0:
@@ -226,7 +248,7 @@ def run_idris():
                 stats_copy = dict(stats)
             stats_copy["elapsed_seconds"] = elapsed
             stats_copy["iteration"] = iteration
-            (output_dir / "stats.json").write_text(json.dumps(stats_copy, indent=2))
+            (output_dir / "stats.json").write_text(json.dumps(stats_copy, indent=2, default=str))
             
             with ppl_lock:
                 save_perplexity_analysis(list(perplexity_log), output_dir)
@@ -243,28 +265,83 @@ def run_idris():
         stats_copy = dict(stats)
     stats_copy["elapsed_seconds"] = time.time() - start_time
     stats_copy["completed"] = True
-    (output_dir / "stats.json").write_text(json.dumps(stats_copy, indent=2))
+    (output_dir / "stats.json").write_text(json.dumps(stats_copy, indent=2, default=str))
     
     with ppl_lock:
         save_perplexity_analysis(perplexity_log, output_dir)
     
-    # Print final summary with weird vs normal breakdown
+    # Print final summary
     print(f"\n{'='*60}")
     print(f"FINAL RESULTS")
     print(f"{'='*60}")
     print(f"Total bugs found: {stats['bugs']}")
-    print(f"  - From weird seeds: {stats['bugs_from_weird_seeds']}")
-    print(f"  - From normal seeds: {stats['bugs_from_normal_seeds']}")
-    print(f"\nGenerated programs:")
-    print(f"  - From weird seeds: {stats['generated_from_weird_seeds']}")
-    print(f"  - From normal seeds: {stats['generated_from_normal_seeds']}")
+    print(f"Total crashes: {stats.get('crashes_verify', 0) + stats.get('crashes_opt', 0)}")
     
-    if stats['generated_from_weird_seeds'] > 0:
-        weird_rate = stats['bugs_from_weird_seeds'] / stats['generated_from_weird_seeds'] * 100
-        print(f"\nBug rate (weird seeds): {weird_rate:.4f}%")
-    if stats['generated_from_normal_seeds'] > 0:
-        normal_rate = stats['bugs_from_normal_seeds'] / stats['generated_from_normal_seeds'] * 100
-        print(f"Bug rate (normal seeds): {normal_rate:.4f}%")
+    print(f"\nBugs by strategy:")
+    for strategy, data in stats["by_strategy"].items():
+        if data["generated"] > 0:
+            bug_rate = data["bugs"] / data["generated"] * 100 if data["generated"] > 0 else 0
+            print(f"  {strategy}: {data['bugs']} bugs / {data['generated']} generated ({bug_rate:.3f}%)")
     
-    print(f"\nCrashes: {stats.get('crashes_verify', 0) + stats.get('crashes_opt', 0)}")
-    print(f"False positives filtered: {stats['false_positives']}")
+    print(f"\nBugs by seed type:")
+    print(f"  From weird seeds: {stats['bugs_from_weird_seeds']}")
+    print(f"  From normal seeds: {stats['bugs_from_normal_seeds']}")
+    
+    if stats.get('generated_with_scalable_vectors', 0) > 0:
+        print(f"\nScalable vector stats:")
+        print(f"  Generated: {stats['generated_with_scalable_vectors']}")
+        print(f"  Bugs: {stats.get('bugs_from_scalable_vectors', 0)}")
+
+
+def run_ab_test():
+    """
+    Run an A/B test comparing different strategies.
+    
+    This runs the fuzzer multiple times with different forced strategies
+    and compares the results.
+    """
+    cfg = get_config()
+    output_base = Path(cfg["paths"]["output_dir"])
+    
+    strategies_to_test = [
+        PromptStrategy.SIGNATURE_ONLY,
+        PromptStrategy.SIGNATURE_WITH_ENTRY,
+        PromptStrategy.PATTERN_GUIDED,
+        PromptStrategy.TYPE_NOVEL,
+    ]
+    
+    results = {}
+    
+    for strategy in strategies_to_test:
+        print(f"\n{'='*60}")
+        print(f"Testing strategy: {strategy.value}")
+        print(f"{'='*60}")
+        
+        # Update config to force this strategy
+        cfg["fuzzer"]["force_strategy"] = strategy.value
+        cfg["paths"]["output_dir"] = str(output_base / f"ab_test_{strategy.value}")
+        
+        # Run fuzzer
+        run_idris()
+        
+        # Load results
+        stats_file = Path(cfg["paths"]["output_dir"]) / "stats.json"
+        if stats_file.exists():
+            results[strategy.value] = json.loads(stats_file.read_text())
+    
+    # Print comparison
+    print(f"\n{'='*60}")
+    print(f"A/B TEST RESULTS")
+    print(f"{'='*60}")
+    
+    for strategy, data in results.items():
+        generated = data.get("generated", 0)
+        bugs = data.get("bugs", 0)
+        crashes = data.get("crashes_verify", 0) + data.get("crashes_opt", 0)
+        rate = bugs / generated * 100 if generated > 0 else 0
+        
+        print(f"{strategy}:")
+        print(f"  Generated: {generated}")
+        print(f"  Bugs: {bugs} ({rate:.4f}%)")
+        print(f"  Crashes: {crashes}")
+        print()

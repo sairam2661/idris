@@ -1,4 +1,4 @@
-from idris.fuzzer import run_idris
+from idris.fuzzer import run_idris, run_ab_test
 
 from idris.parser import (
     ParsedFunction,
@@ -21,6 +21,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "run_idris",
+    "run_ab_test",
     
     # Parser
     'ParsedFunction',

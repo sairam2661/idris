@@ -474,6 +474,15 @@ def validation_worker(item, bugs_dir, valid_dir, fp_dir, stats, stats_lock,
                 stats["bugs_from_weird_seeds"] = stats.get("bugs_from_weird_seeds", 0) + 1
             else:
                 stats["bugs_from_normal_seeds"] = stats.get("bugs_from_normal_seeds", 0) + 1
+            
+            # NEW: Track by strategy
+            strategy = ppl_info.get("strategy", prompt_type)
+            if "by_strategy" in stats and strategy in stats["by_strategy"]:
+                stats["by_strategy"][strategy]["bugs"] += 1
+            
+            # NEW: Track scalable vectors
+            if ppl_info.get("seed_has_scalable_vectors"):
+                stats["bugs_from_scalable_vectors"] = stats.get("bugs_from_scalable_vectors", 0) + 1
         
         bug_dir = bugs_dir / f"bug_{bug_id:04d}"
         bug_dir.mkdir(exist_ok=True)
@@ -488,22 +497,21 @@ def validation_worker(item, bugs_dir, valid_dir, fp_dir, stats, stats_lock,
             "mean_logprob": ppl_info.get("mean_logprob"),
             "min_logprob": ppl_info.get("min_logprob"),
             "num_tokens": ppl_info.get("num_tokens"),
-            "mutation_strategy": ppl_info.get("mutation_strategy"),
+            "strategy": ppl_info.get("strategy"),  # NEW
+            "pattern_name": ppl_info.get("pattern_name"),  # NEW
             "is_weird_seed": is_weird_seed,
             "seed_perplexity": seed_perplexity,
+            "seed_has_scalable_vectors": ppl_info.get("seed_has_scalable_vectors"),  # NEW
         }))
         
-        ppl_str = f" PPL: {ppl_info.get('perplexity'):.2f}" if ppl_info.get('perplexity') else ""
-        strategy_str = f" [{ppl_info.get('mutation_strategy', 'unknown')}]"
+        # Updated print with strategy info
+        ppl_str = f" PPL:{ppl_info.get('perplexity'):.2f}" if ppl_info.get('perplexity') else ""
+        strategy_str = f" [{ppl_info.get('strategy', 'unknown')}]"
         weird_str = " [WEIRD]" if is_weird_seed else ""
-        print(f"\n[BUG {bug_id}] Found miscompilation!{ppl_str}{strategy_str}{weird_str}")
+        scalable_str = " [SCALABLE]" if ppl_info.get("seed_has_scalable_vectors") else ""
+        print(f"\n[BUG {bug_id}] Miscompilation!{ppl_str}{strategy_str}{weird_str}{scalable_str}")
         print(f"Source:\n{ir[:200]}...")
         
-        record["outcome"] = "bug"
-        with ppl_lock:
-            perplexity_log.append(record)
-        return "bug"
-    
     elif result["timeout"]:
         with stats_lock:
             stats["timeout"] += 1
