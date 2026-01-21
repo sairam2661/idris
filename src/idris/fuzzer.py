@@ -1,8 +1,8 @@
 """
-LLVM IR Fuzzer using Language Models - Pattern-Guided Version
+LLVM IR Fuzzer - Diverse Generation with Multi-Pass Testing
 
-This version removes FileCheck mutation complexity and focuses on
-generating prompts from signatures + semantic hints.
+Generates diverse test cases using LLM completion and tests them
+against multiple LLVM optimization passes to find crashes and miscompilations.
 """
 
 from pathlib import Path
@@ -14,19 +14,18 @@ import json
 from vllm import LLM, SamplingParams
 
 from idris.config import get_config
-from idris.parser import parse_functions_from_directory
-from idris.prompts import (
-    PatternGuidedGenerator,
-    PromptStrategy,
-    collect_seeds,
+from idris.generator import DiverseGenerator, build_corpus, Strategy
+from idris.validation import (
+    multi_pass_validation_worker,
+    ALL_PASSES,
+    QUICK_PASSES,
 )
-from idris.scoring import score_seeds, get_scoring_stats
-from idris.utils import complete_function, extract_logprobs, save_perplexity_analysis
-from idris.validation import validation_worker
+from idris.utils import complete_function
 
 
-def run_idris():
-    """Main fuzzing loop with pattern-guided generation."""
+def run_fuzzer():
+    """Main fuzzing loop with diverse generation and multi-pass testing."""
+    
     cfg = get_config()
     
     # Paths
@@ -41,116 +40,73 @@ def run_idris():
     num_workers = cfg["fuzzer"]["num_workers"]
     model_name = cfg["fuzzer"]["model"]
     
-    # Strategy settings
-    vector_ratio = cfg["fuzzer"].get("vector_ratio", 0.3)
-    scalable_ratio = cfg["fuzzer"].get("scalable_ratio", 0.2)
+    # Pass selection
+    use_quick_passes = cfg["fuzzer"].get("quick_passes", False)
+    passes = QUICK_PASSES if use_quick_passes else ALL_PASSES
     
-    # Perplexity-based seed selection
-    score_seeds_enabled = cfg["fuzzer"].get("score_seeds", True)
-    weird_ratio = cfg["fuzzer"].get("weird_ratio", 0.3)
-    prefer_weird_prob = cfg["fuzzer"].get("prefer_weird_prob", 0.5)
-    
-    # Optional: force a specific strategy for A/B testing
-    # Set to None to use weighted random selection
-    force_strategy_name = cfg["fuzzer"].get("force_strategy", None)
-    force_strategy = None
-    if force_strategy_name:
-        try:
-            force_strategy = PromptStrategy(force_strategy_name)
-            print(f"Forcing strategy: {force_strategy.value}")
-        except ValueError:
-            print(f"Unknown strategy '{force_strategy_name}', using random")
+    # Also always include O2 for comparison
+    if "default<O2>" not in passes:
+        passes = passes + ["default<O2>"]
     
     # Setup output directories
     output_dir.mkdir(exist_ok=True)
-    bugs_dir = output_dir / "bugs"
-    bugs_dir.mkdir(exist_ok=True)
-    valid_dir = output_dir / "valid"
-    valid_dir.mkdir(exist_ok=True)
-    fp_dir = output_dir / "false_positives"
-    fp_dir.mkdir(exist_ok=True)
+    output_dirs = {
+        "bugs": output_dir / "bugs",
+        "crashes": output_dir / "crashes",
+        "valid": output_dir / "valid",
+        "fp": output_dir / "false_positives",
+    }
+    for d in output_dirs.values():
+        d.mkdir(exist_ok=True)
     
-    # Collect seeds
-    print("Collecting seed functions...")
-    seeds = collect_seeds(llvm_test_dir, max_count=10000)
-    print(f"Collected {len(seeds)} seeds")
+    # Build corpus from LLVM test directory
+    print("Building corpus from test directory...")
+    corpus = build_corpus(llvm_test_dir, max_files=10000)
+    print(f"Built corpus with {len(corpus)} test files")
     
-    # Load model
-    print(f"Loading {model_name}...")
-    llm = LLM(model=model_name, trust_remote_code=True)
-    
-    # Score seeds by perplexity
-    seed_scores = None
-    if score_seeds_enabled:
-        print("Scoring seeds by perplexity...")
-        seed_scores = score_seeds(llm, seeds, batch_size=64, verbose=True)
-        
-        scoring_stats = get_scoring_stats(seed_scores)
-        print(f"Scoring complete:")
-        print(f"  - Scored: {scoring_stats['num_scored']} seeds")
-        print(f"  - Perplexity range: {scoring_stats['min_perplexity']:.2f} - {scoring_stats['max_perplexity']:.2f}")
-        print(f"  - Mean: {scoring_stats['mean_perplexity']:.2f}")
-        
-        (output_dir / "scoring_stats.json").write_text(json.dumps(scoring_stats, indent=2))
-    
-    # Create pattern-guided generator
-    generator = PatternGuidedGenerator(
-        seeds=seeds,
-        seed_scores=seed_scores,
-        weird_ratio=weird_ratio,
-        prefer_weird_prob=prefer_weird_prob,
-    )
-    
-    # Log generator stats
+    # Create diverse generator
+    generator = DiverseGenerator(corpus)
     gen_stats = generator.stats()
     print(f"\nGenerator statistics:")
-    print(f"  - Total seeds: {gen_stats['total_seeds']}")
-    print(f"  - Vector seeds: {gen_stats['vector_seeds']}")
-    print(f"  - Scalable vector seeds: {gen_stats['scalable_vector_seeds']}")
-    print(f"  - Weird seeds: {gen_stats['weird_seeds']}")
-    print(f"  - Normal seeds: {gen_stats['normal_seeds']}")
+    print(f"  Test files: {gen_stats['total_test_files']}")
+    print(f"  Passes covered: {gen_stats['num_passes']}")
+    print(f"  With vectors: {gen_stats['with_vectors']}")
+    print(f"  With scalable vectors: {gen_stats['with_scalable']}")
+    print(f"  With loops: {gen_stats['with_loops']}")
     
-    (output_dir / "generator_stats.json").write_text(json.dumps(gen_stats, indent=2))
+    (output_dir / "generator_stats.json").write_text(json.dumps(gen_stats, indent=2, default=str))
+    
+    # Load LLM
+    print(f"\nLoading {model_name}...")
+    llm = LLM(model=model_name, trust_remote_code=True)
     
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
         temperature=temperature,
-        top_p=0.9,
-        presence_penalty=0.15,
-        logprobs=1,
+        top_p=0.95,
     )
     
     # Statistics tracking
     stats = {
         "generated": 0,
         "valid": 0,
-        "optimized": 0,
+        "invalid": 0,
+        "rejected": 0,
+        "crashes": 0,
+        "miscompiles": 0,
         "correct": 0,
-        "bugs": 0,
-        "timeout": 0,
         "false_positives": 0,
-        "crashes_verify": 0,
-        "crashes_opt": 0,
-        # Track by strategy
-        "by_strategy": {s.value: {"generated": 0, "valid": 0, "bugs": 0, "crashes": 0} 
-                       for s in PromptStrategy},
-        # Track by seed type
-        "bugs_from_weird_seeds": 0,
-        "bugs_from_normal_seeds": 0,
-        "generated_from_weird_seeds": 0,
-        "generated_from_normal_seeds": 0,
-        # Track by vector type
-        "bugs_from_scalable_vectors": 0,
-        "generated_with_scalable_vectors": 0,
+        "timeouts": 0,
     }
     stats_lock = threading.Lock()
-    
-    perplexity_log = []
-    ppl_lock = threading.Lock()
     
     # Thread pool for validation
     executor = ThreadPoolExecutor(max_workers=num_workers)
     pending_futures = []
+    
+    print(f"\nStarting fuzzing...")
+    print(f"Testing {len(passes)} passes: {', '.join(passes[:5])}{'...' if len(passes) > 5 else ''}")
+    print(f"Batch size: {batch_size}, Iterations: {num_iterations}")
     
     start_time = time.time()
     
@@ -158,70 +114,47 @@ def run_idris():
         iter_start = time.time()
         
         # Generate batch of prompts
-        batch = generator.generate_batch(
-            batch_size=batch_size,
-            vector_ratio=vector_ratio,
-            scalable_ratio=scalable_ratio,
-            strategy=force_strategy,  # None = random weighted selection
-        )
-        
+        batch = generator.generate_batch(batch_size)
         prompts = [p for p, _ in batch]
         metadata_list = [m for _, m in batch]
         
-        # Generate completions
+        # Generate completions with LLM
         outputs = llm.generate(prompts, sampling_params)
         
-        # Update generation stats
-        with stats_lock:
-            stats["generated"] += len(outputs)
-            for meta in metadata_list:
-                strategy = meta.get("strategy", "unknown")
-                if strategy in stats["by_strategy"]:
-                    stats["by_strategy"][strategy]["generated"] += 1
-                
-                if meta.get("is_weird_seed"):
-                    stats["generated_from_weird_seeds"] += 1
-                else:
-                    stats["generated_from_normal_seeds"] += 1
-                
-                if meta.get("seed_has_scalable_vectors"):
-                    stats["generated_with_scalable_vectors"] += 1
-        
         # Process completions
+        submitted = 0
         for idx, output in enumerate(outputs):
             prompt = prompts[idx]
             metadata = metadata_list[idx]
             completion = output.outputs[0].text
             
             # Skip very short completions
-            if len(completion) < 30:
+            if len(completion) < 20:
                 continue
             
-            # Try to complete the function
+            # Try to complete the function (balance braces)
             ir = complete_function(prompt, completion)
             if ir is None:
                 continue
             
-            # Extract perplexity info
-            ppl_info = extract_logprobs(output)
-            ppl_info["strategy"] = metadata.get("strategy")
-            ppl_info["seed_has_vectors"] = metadata.get("seed_has_vectors", False)
-            ppl_info["seed_has_scalable_vectors"] = metadata.get("seed_has_scalable_vectors", False)
-            ppl_info["is_weird_seed"] = metadata.get("is_weird_seed", False)
-            ppl_info["seed_perplexity"] = metadata.get("seed_perplexity")
-            ppl_info["pattern_name"] = metadata.get("pattern_name")
+            submitted += 1
             
-            # Submit for validation
+            # Submit for multi-pass validation
             future = executor.submit(
-                validation_worker,
-                (ir, prompt, metadata.get("strategy", "unknown"), ppl_info),
-                bugs_dir, valid_dir, fp_dir, stats, stats_lock,
-                perplexity_log, ppl_lock
+                multi_pass_validation_worker,
+                (ir, metadata),
+                passes,
+                output_dirs,
+                stats,
+                stats_lock,
             )
             pending_futures.append(future)
         
+        with stats_lock:
+            stats["generated"] += len(outputs)
+        
         # Clean up completed futures
-        done_futures = [f for f in pending_futures if f.done()]
+        done = [f for f in pending_futures if f.done()]
         pending_futures = [f for f in pending_futures if not f.done()]
         
         # Progress update
@@ -229,119 +162,157 @@ def run_idris():
         elapsed = time.time() - start_time
         
         with stats_lock:
-            crashes = stats.get('crashes_verify', 0) + stats.get('crashes_opt', 0)
-            
-            # Strategy breakdown
-            strategy_bugs = {k: v["bugs"] for k, v in stats["by_strategy"].items() if v["bugs"] > 0}
-            strategy_str = " ".join([f"{k}:{v}" for k, v in strategy_bugs.items()]) if strategy_bugs else ""
-            
             print(f"[{iteration+1}/{num_iterations}] {iter_time:.1f}s | "
                   f"Gen:{stats['generated']} Valid:{stats['valid']} "
-                  f"Bugs:{stats['bugs']} Crashes:{crashes} "
-                  f"Pending:{len(pending_futures)}")
-            if strategy_str:
-                print(f"  Bugs by strategy: {strategy_str}")
+                  f"Crashes:{stats['crashes']} Bugs:{stats['miscompiles']} "
+                  f"FP:{stats['false_positives']} Pending:{len(pending_futures)}")
         
-        # Periodic saves
+        # Periodic save
         if iteration % 10 == 0:
-            with stats_lock:
-                stats_copy = dict(stats)
-            stats_copy["elapsed_seconds"] = elapsed
-            stats_copy["iteration"] = iteration
-            (output_dir / "stats.json").write_text(json.dumps(stats_copy, indent=2, default=str))
-            
-            with ppl_lock:
-                save_perplexity_analysis(list(perplexity_log), output_dir)
+            save_stats(stats, stats_lock, output_dir, elapsed, iteration, passes)
     
     # Wait for remaining validations
-    print("Waiting for pending validations...")
+    print("\nWaiting for pending validations...")
     for f in as_completed(pending_futures):
         pass
     
     executor.shutdown()
     
     # Final save
+    elapsed = time.time() - start_time
+    save_stats(stats, stats_lock, output_dir, elapsed, num_iterations, passes, completed=True)
+    
+    # Print summary
+    print_summary(stats, elapsed, passes)
+
+
+def save_stats(stats, stats_lock, output_dir, elapsed, iteration, passes, completed=False):
+    """Save current statistics to file."""
     with stats_lock:
         stats_copy = dict(stats)
-    stats_copy["elapsed_seconds"] = time.time() - start_time
-    stats_copy["completed"] = True
+    
+    stats_copy["elapsed_seconds"] = elapsed
+    stats_copy["iteration"] = iteration
+    stats_copy["passes_tested"] = passes
+    stats_copy["completed"] = completed
+    
     (output_dir / "stats.json").write_text(json.dumps(stats_copy, indent=2, default=str))
-    
-    with ppl_lock:
-        save_perplexity_analysis(perplexity_log, output_dir)
-    
-    # Print final summary
-    print(f"\n{'='*60}")
-    print(f"FINAL RESULTS")
-    print(f"{'='*60}")
-    print(f"Total bugs found: {stats['bugs']}")
-    print(f"Total crashes: {stats.get('crashes_verify', 0) + stats.get('crashes_opt', 0)}")
-    
-    print(f"\nBugs by strategy:")
-    for strategy, data in stats["by_strategy"].items():
-        if data["generated"] > 0:
-            bug_rate = data["bugs"] / data["generated"] * 100 if data["generated"] > 0 else 0
-            print(f"  {strategy}: {data['bugs']} bugs / {data['generated']} generated ({bug_rate:.3f}%)")
-    
-    print(f"\nBugs by seed type:")
-    print(f"  From weird seeds: {stats['bugs_from_weird_seeds']}")
-    print(f"  From normal seeds: {stats['bugs_from_normal_seeds']}")
-    
-    if stats.get('generated_with_scalable_vectors', 0) > 0:
-        print(f"\nScalable vector stats:")
-        print(f"  Generated: {stats['generated_with_scalable_vectors']}")
-        print(f"  Bugs: {stats.get('bugs_from_scalable_vectors', 0)}")
 
 
-def run_ab_test():
+def print_summary(stats, elapsed, passes):
+    """Print final summary."""
+    print(f"\n{'='*70}")
+    print("FUZZING COMPLETE")
+    print(f"{'='*70}")
+    print(f"Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"Total generated: {stats['generated']}")
+    print(f"Valid IR: {stats['valid']}")
+    print(f"Invalid/Rejected: {stats.get('invalid', 0) + stats.get('rejected', 0)}")
+    print(f"\nBugs found:")
+    print(f"  Crashes: {stats['crashes']}")
+    print(f"  Miscompiles: {stats['miscompiles']}")
+    print(f"  False positives: {stats['false_positives']}")
+    print(f"  Timeouts: {stats['timeouts']}")
+    
+    # Print per-pass breakdown
+    print(f"\nCrashes by pass:")
+    for pass_name in passes:
+        key = f"crashes_{pass_name}"
+        count = stats.get(key, 0)
+        if count > 0:
+            print(f"  {pass_name}: {count}")
+    
+    print(f"\nMiscompiles by pass:")
+    for pass_name in passes:
+        key = f"miscompiles_{pass_name}"
+        count = stats.get(key, 0)
+        if count > 0:
+            print(f"  {pass_name}: {count}")
+    
+    # Print by strategy
+    print(f"\nCrashes by strategy:")
+    for key, value in stats.items():
+        if key.startswith("crashes_strategy_") and value > 0:
+            strategy = key.replace("crashes_strategy_", "")
+            print(f"  {strategy}: {value}")
+    
+    print(f"\nMiscompiles by strategy:")
+    for key, value in stats.items():
+        if key.startswith("miscompiles_strategy_") and value > 0:
+            strategy = key.replace("miscompiles_strategy_", "")
+            print(f"  {strategy}: {value}")
+
+
+def run_on_existing(valid_dir: Path):
     """
-    Run an A/B test comparing different strategies.
+    Run multi-pass testing on existing valid IR files.
     
-    This runs the fuzzer multiple times with different forced strategies
-    and compares the results.
+    Useful for finding bugs in IR that was previously only tested with O2.
     """
     cfg = get_config()
-    output_base = Path(cfg["paths"]["output_dir"])
+    output_dir = Path(cfg["paths"]["output_dir"]) / "retest"
     
-    strategies_to_test = [
-        PromptStrategy.SIGNATURE_ONLY,
-        PromptStrategy.SIGNATURE_WITH_ENTRY,
-        PromptStrategy.PATTERN_GUIDED,
-        PromptStrategy.TYPE_NOVEL,
-    ]
+    output_dir.mkdir(exist_ok=True)
+    output_dirs = {
+        "bugs": output_dir / "bugs",
+        "crashes": output_dir / "crashes", 
+        "valid": output_dir / "valid",
+        "fp": output_dir / "false_positives",
+    }
+    for d in output_dirs.values():
+        d.mkdir(exist_ok=True)
     
-    results = {}
+    passes = QUICK_PASSES
     
-    for strategy in strategies_to_test:
-        print(f"\n{'='*60}")
-        print(f"Testing strategy: {strategy.value}")
-        print(f"{'='*60}")
+    stats = {
+        "tested": 0,
+        "crashes": 0,
+        "miscompiles": 0,
+        "correct": 0,
+        "false_positives": 0,
+        "timeouts": 0,
+    }
+    stats_lock = threading.Lock()
+    
+    ll_files = list(valid_dir.glob("*.ll"))
+    print(f"Found {len(ll_files)} IR files to test")
+    print(f"Testing {len(passes)} passes...")
+    
+    executor = ThreadPoolExecutor(max_workers=cfg["fuzzer"]["num_workers"])
+    futures = []
+    
+    for ll_file in ll_files:
+        ir = ll_file.read_text()
+        metadata = {
+            "strategy": "existing",
+            "source_file": str(ll_file),
+        }
         
-        # Update config to force this strategy
-        cfg["fuzzer"]["force_strategy"] = strategy.value
-        cfg["paths"]["output_dir"] = str(output_base / f"ab_test_{strategy.value}")
-        
-        # Run fuzzer
-        run_idris()
-        
-        # Load results
-        stats_file = Path(cfg["paths"]["output_dir"]) / "stats.json"
-        if stats_file.exists():
-            results[strategy.value] = json.loads(stats_file.read_text())
+        future = executor.submit(
+            multi_pass_validation_worker,
+            (ir, metadata),
+            passes,
+            output_dirs,
+            stats,
+            stats_lock,
+        )
+        futures.append(future)
     
-    # Print comparison
+    # Wait with progress
+    for i, f in enumerate(as_completed(futures)):
+        if (i + 1) % 100 == 0:
+            with stats_lock:
+                print(f"[{i+1}/{len(futures)}] Crashes:{stats['crashes']} Bugs:{stats['miscompiles']}")
+    
+    executor.shutdown()
+    
+    # Summary
     print(f"\n{'='*60}")
-    print(f"A/B TEST RESULTS")
+    print("RETEST COMPLETE")
     print(f"{'='*60}")
+    print(f"Tested: {len(ll_files)} files × {len(passes)} passes")
+    print(f"Crashes: {stats['crashes']}")
+    print(f"Miscompiles: {stats['miscompiles']}")
     
-    for strategy, data in results.items():
-        generated = data.get("generated", 0)
-        bugs = data.get("bugs", 0)
-        crashes = data.get("crashes_verify", 0) + data.get("crashes_opt", 0)
-        rate = bugs / generated * 100 if generated > 0 else 0
-        
-        print(f"{strategy}:")
-        print(f"  Generated: {generated}")
-        print(f"  Bugs: {bugs} ({rate:.4f}%)")
-        print(f"  Crashes: {crashes}")
-        print()
+    # Save stats
+    (output_dir / "stats.json").write_text(json.dumps(stats, indent=2, default=str))

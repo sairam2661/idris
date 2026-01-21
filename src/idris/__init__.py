@@ -1,4 +1,4 @@
-from idris.fuzzer import run_idris, run_ab_test
+from idris.fuzzer import run_fuzzer, run_on_existing
 
 from idris.parser import (
     ParsedFunction,
@@ -17,11 +17,14 @@ from idris.mutator import (
     create_mutator,
 )
 
+from idris.config import get_config
+
 __version__ = "0.1.0"
 
 __all__ = [
-    "run_idris",
-    "run_ab_test",
+    # Fuzzer
+    "run_fuzzer",
+    "run_on_existing",
     
     # Parser
     'ParsedFunction',
@@ -37,4 +40,7 @@ __all__ = [
     'MutationStrategy',
     'MutationResult',
     'create_mutator',
+    
+    # Config
+    'get_config',
 ]
